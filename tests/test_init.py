@@ -49,15 +49,21 @@ def _hass() -> SimpleNamespace:
     )
 
 
-def _registry(*devices: SimpleNamespace) -> SimpleNamespace:
+def _registry() -> SimpleNamespace:
     """Return the device-registry surface used by setup and cleanup."""
     return SimpleNamespace(
         async_get_or_create=Mock(),
         async_remove_device=Mock(),
         async_update_device=Mock(),
-        _devices=SimpleNamespace(
-            get_devices_for_config_entry_id=Mock(return_value=list(devices))
-        ),
+    )
+
+
+def _patch_registry_entries(*devices: SimpleNamespace):
+    """Patch the public device-registry entry lookup."""
+    return patch.object(
+        integration.dr,
+        "async_entries_for_config_entry",
+        return_value=list(devices),
     )
 
 
@@ -128,7 +134,8 @@ def test_register_devices_covers_all_inventory_types() -> None:
     )
     registry = _registry()
 
-    integration._register_devices(registry, entry)
+    with _patch_registry_entries():
+        integration._register_devices(registry, entry)
 
     assert registry.async_get_or_create.call_count == 7
     calls = [call.kwargs for call in registry.async_get_or_create.call_args_list]
@@ -171,7 +178,8 @@ def test_register_devices_labels_indexed_sub_meter() -> None:
     entry = SimpleNamespace(data={}, entry_id="entry-id", runtime_data=runtime)
     registry = _registry()
 
-    integration._register_devices(registry, entry)
+    with _patch_registry_entries():
+        integration._register_devices(registry, entry)
 
     calls = [call.kwargs for call in registry.async_get_or_create.call_args_list]
     assert [item["name"] for item in calls] == ["Energy meter", "EASTRON SEM3-M-2L-CT2"]
@@ -201,7 +209,8 @@ def test_register_devices_detaches_only_authoritatively_stale_devices() -> None:
         }
     )
     entry = SimpleNamespace(entry_id="entry-id", runtime_data=runtime)
-    registry = _registry(
+    registry = _registry()
+    current_entries = [
         _device("current-inverter", (DOMAIN, "INV-1")),
         _device(
             "current-multi-identifier",
@@ -215,9 +224,10 @@ def test_register_devices_detaches_only_authoritatively_stale_devices() -> None:
         _device("current-meter", (DOMAIN, "meter_METER-1")),
         _device("stale-meter", (DOMAIN, "meter_OLD-METER")),
         _device("other-integration", ("other", "device")),
-    )
+    ]
 
-    integration._register_devices(registry, entry)
+    with _patch_registry_entries(*current_entries) as entries_for_config_entry:
+        integration._register_devices(registry, entry)
 
     assert registry.async_update_device.call_args_list == [
         call(device_id="stale-inverter", remove_config_entry_id="entry-id"),
@@ -226,7 +236,7 @@ def test_register_devices_detaches_only_authoritatively_stale_devices() -> None:
         call(device_id="stale-meter", remove_config_entry_id="entry-id"),
     ]
     registry.async_remove_device.assert_not_called()
-    registry._devices.get_devices_for_config_entry_id.assert_called_once_with("entry-id")
+    entries_for_config_entry.assert_called_once_with(registry, "entry-id")
 
 
 def test_register_devices_preserves_uncertain_dongle_and_meter_entries() -> None:
@@ -250,14 +260,16 @@ def test_register_devices_preserves_uncertain_dongle_and_meter_entries() -> None
             }
         ),
     )
-    registry = _registry(
+    registry = _registry()
+    current_entries = [
         _device("stale-dongle", (DOMAIN, "dongle_OLD-DG")),
         _device("stale-meter", (DOMAIN, "meter_OLD-METER")),
         _device("current-battery", (DOMAIN, "battery_BAT-PRESENT")),
         _device("stale-battery", (DOMAIN, "battery_OLD-BAT")),
-    )
+    ]
 
-    integration._register_devices(registry, entry)
+    with _patch_registry_entries(*current_entries):
+        integration._register_devices(registry, entry)
 
     assert registry.async_get_or_create.call_args.kwargs["connections"] == {
         (dr.CONNECTION_NETWORK_MAC, "aa:bb:cc:dd:ee:ff")
@@ -334,6 +346,7 @@ async def test_setup_entry_imports_real_platforms_and_builds_runtime() -> None:
         patch.object(integration, "SolplanetClient", return_value=client) as client_factory,
         patch.object(integration.SolplanetApiAdapter, "create", AsyncMock(return_value=api)),
         patch.object(integration.dr, "async_get", return_value=registry),
+        _patch_registry_entries() as entries_for_config_entry,
         patch.object(
             integration,
             "SolplanetMetadataUpdateCoordinator",
@@ -376,13 +389,14 @@ async def test_setup_entry_imports_real_platforms_and_builds_runtime() -> None:
     assert hass.data[DOMAIN][entry.entry_id] is entry.runtime_data
     entry.async_on_unload.assert_called_once_with("remove-listener")
     listener = metadata.async_add_listener.call_args.args[0]
-    assert registry._devices.get_devices_for_config_entry_id.call_count == 1
-    metadata.last_update_success = False
-    listener()
-    assert registry._devices.get_devices_for_config_entry_id.call_count == 1
-    metadata.last_update_success = True
-    listener()
-    assert registry._devices.get_devices_for_config_entry_id.call_count == 2
+    entries_for_config_entry.assert_called_once_with(registry, "entry-id")
+    with _patch_registry_entries() as listener_entries:
+        metadata.last_update_success = False
+        listener()
+        assert listener_entries.call_count == 0
+        metadata.last_update_success = True
+        listener()
+        assert listener_entries.call_count == 1
     hass.config_entries.async_forward_entry_setups.assert_awaited_once_with(
         entry,
         integration.PLATFORMS,
